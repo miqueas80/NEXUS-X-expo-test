@@ -1,11 +1,13 @@
 (() => {
 'use strict';
 const DOM = globalThis.document;
+const PREVIEW_STORAGE_PREFIX=location.pathname.startsWith('/NEXUS-X-expo-test/')?'nexus-expo-test:':'';
+const localStorage={getItem:key=>globalThis.localStorage.getItem(PREVIEW_STORAGE_PREFIX+key),setItem:(key,value)=>globalThis.localStorage.setItem(PREVIEW_STORAGE_PREFIX+key,value),removeItem:key=>globalThis.localStorage.removeItem(PREVIEW_STORAGE_PREFIX+key)};
 if (!DOM || typeof DOM.querySelector !== 'function') throw new Error('NEXUS-X requiere un entorno de navegador con DOM.');
 const $ = (s, r=DOM) => r.querySelector(s);
 const $$ = (s, r=DOM) => [...r.querySelectorAll(s)];
 const DB_KEY='nexus_x_inventory_v1';
-const DOC_DB='NEXUS_X_DOCUMENTS_V2';
+const DOC_DB='NEXUS_X_DOCUMENTS_V2'+(PREVIEW_STORAGE_PREFIX?':expo-test':'');
 const DOC_STORE='documents';
 const DOC_CACHE_VERSION=3;
 const XKIRO_API='https://nexus-xkiro-gateway.proyectomj11.workers.dev';
@@ -16,7 +18,7 @@ const REPO_OWNER='miqueas80';
 const REPO_NAME='';
 const REPO_BRANCH='';
 const DOC_MAX_BYTES=16*1024*1024;
-const APP_VERSION='2026.10.07-r31.2-xkiro-expo-test';
+const APP_VERSION='2026.10.07-r31.3-expo-preview';
 const INVENTORY_RECOVERY_KEY='nexus_x_inventory_recovery_v1';
 const health={storage:'sin comprobar',documents:'sin comprobar',errors:[],boot:'BOOT'};
 const LENS_EXTERNAL_CACHE_TTL=30*60*1000;
@@ -1318,7 +1320,7 @@ function configuredLensVisionProxy(){
 }
 function parseLensVisionPayload(value){
  let raw=value;if(typeof raw==='string'){const clean=raw.replace(/^```(?:json)?\s*/i,'').replace(/```\s*$/,'').trim(),start=clean.indexOf('{'),end=clean.lastIndexOf('}');if(start<0||end<=start)throw new Error('El proveedor visual no devolvió JSON válido.');raw=JSON.parse(clean.slice(start,end+1))}
- if(!raw||typeof raw!=='object'||Array.isArray(raw))throw new Error('Respuesta visual inválida.');const list=value=>[...(Array.isArray(value)?value:[])].map(x=>String(x||'').trim()).filter(Boolean).slice(0,12),categories=new Set(['reactivo','frasco','instrumental','equipo','componente','codigo','formula','etiqueta','pictograma','objeto-general','desconocido']);
+ if(!raw||typeof raw!=='object'||Array.isArray(raw))throw new Error('Respuesta visual inválida.');const list=value=>[...(Array.isArray(value)?value:[])].map(x=>x==null?'':(typeof x==='object'?JSON.stringify(x):String(x)).trim().slice(0,500)).filter(Boolean).slice(0,12),categories=new Set(['reactivo','frasco','instrumental','equipo','componente','codigo','formula','etiqueta','pictograma','objeto-general','desconocido']);
  return {category:categories.has(raw.category)?raw.category:'desconocido',hypothesis:String(raw.hypothesis||'').trim().slice(0,300),confidence:Math.max(0,Math.min(100,Math.round(Number(raw.confidence)||0))),objects:list(raw.objects),visibleText:list(raw.visibleText),formulaCandidates:list(raw.formulaCandidates),codes:list(raw.codes),pictograms:list(raw.pictograms),manufacturer:String(raw.manufacturer||'').trim().slice(0,160),model:String(raw.model||'').trim().slice(0,160),observableEvidence:list(raw.observableEvidence),limitations:list(raw.limitations)};
 }
 function lensVisionPrompt(){return 'Actuás como SEGUNDA OPINIÓN visual de NEXUS LENS sobre UNA fotografía. Devolvé exclusivamente JSON válido, sin markdown, con: category (reactivo|frasco|instrumental|equipo|componente|codigo|formula|etiqueta|pictograma|objeto-general|desconocido), hypothesis, confidence (0-100), objects[], visibleText[], formulaCandidates[], codes[], pictograms[], manufacturer, model, observableEvidence[], limitations[]. REGLAS ESTRICTAS: hypothesis describe únicamente la CLASE DE OBJETO visible, nunca la identidad química, composición, concentración o contenido. No infieras ingredientes por color, envase, marca, forma o contexto. Si leés texto de una etiqueta, copialo literalmente sólo en visibleText y/o formulaCandidates; no lo conviertas por sí solo en identidad. Si el objeto está fuera del dominio de laboratorio o la evidencia es insuficiente, category debe ser desconocido y confidence bajo. No completes huecos creativamente. Un pictograma sólo se informa si está claramente visible.'}
@@ -2402,6 +2404,7 @@ async function requestMicrophonePermission({silent=false}={}){
   }catch(e){const map={NotAllowedError:'Micrófono bloqueado. Permitilo para este sitio en Chrome.',PermissionDeniedError:'Permiso de micrófono denegado.',NotFoundError:'No se encontró un micrófono.',NotReadableError:'El micrófono está ocupado por otra aplicación.'};const msg=map[e.name]||`No se pudo acceder al micrófono: ${e.message||e}`;$('#voiceStatusText').textContent=msg;if(!silent)toast(msg);return false}
 }
 function handleStorageChange(event){
+ if(PREVIEW_STORAGE_PREFIX){if(!event.key?.startsWith(PREVIEW_STORAGE_PREFIX))return;event={key:event.key.slice(PREVIEW_STORAGE_PREFIX.length),newValue:event.newValue}}
  if(event.key===DB_KEY&&event.newValue!==state.inventoryRaw){
   if($('#itemModal').classList.contains('open')){state.inventoryError='El inventario cambió en otra pestaña. Conservá el formulario y recargá antes de guardar.';renderDashboard();toast(state.inventoryError);return}
   try{if(event.newValue===null)throw new Error('Se retiró el inventario del almacenamiento.');const rows=JSON.parse(event.newValue);validateInventory(rows,null);state.inventory=rows;state.inventoryRaw=event.newValue;state.inventoryReadOnly=false;state.inventoryError='';renderAll()}
