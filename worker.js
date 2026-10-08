@@ -101,10 +101,18 @@ async function upstreamRequest(url,options){
  const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),25000);
  try{const upstream=await fetch(url,{...options,signal:controller.signal});const body=await upstream.text();return {upstream,body}}finally{clearTimeout(timer)}
 }
-function upstreamFailure(response,cors){
+function upstreamFailure(response,cors,body='',model='',secret=''){
  const headers={...cors};const retry=response.headers.get('Retry-After');if(retry&&/^(\d+|[A-Za-z]{3},[ -~]{1,80})$/.test(retry))headers['Retry-After']=retry;
  if(response.status===429&&!headers['Retry-After'])headers['Retry-After']='60';
- return json({error:'Proveedor externo no disponible',status:response.status},response.status,headers);
+ let data={};try{data=JSON.parse(body)}catch{}
+ const rawMessage=String(data?.error?.message||'');
+ const modelAuth=response.status===401&&/^User not found\.?$/i.test(rawMessage.trim())&&(!secret||!rawMessage.includes(secret));
+ const blocked=Number(data.error_code)===1010||response.status===403&&/error\s*(?:code\s*)?1010/i.test(body.slice(0,16384));
+ const kind=blocked?'cloudflare_block':modelAuth?'model_auth':[401,403].includes(response.status)?'authentication':response.status===429?'rate_limit':response.status===503?'model_unavailable':'upstream';
+ const rayId=String(data.ray_id||response.headers.get('CF-Ray')||'').replace(/[^A-Za-z0-9-]/g,'').slice(0,80);
+ const safeModel=/^[A-Za-z0-9_.:/-]{1,200}$/.test(model)&&(!secret||!model.includes(secret))?model:'';
+ const detail={kind,message:modelAuth?'User not found.':blocked?'Cloudflare Error 1010':'Proveedor externo no disponible',code:modelAuth?'authentication_error':blocked?'1010':kind,model:safeModel,rayId:secret&&rayId.includes(secret)?'':rayId,domain:'api.xkiro.com'};
+ return json({error:{message:'Proveedor externo no disponible',detail},status:response.status},response.status,headers);
 }
 
 export default {
@@ -151,7 +159,7 @@ export default {
         const {upstream,body} = await upstreamRequest('https://api.xkiro.com/v1/models', {
           headers: { 'Accept': 'application/json' }
         });
-        if(!upstream.ok)return upstreamFailure(upstream,cors);
+        if(!upstream.ok)return upstreamFailure(upstream,cors,body);
         return new Response(body, {
           status: upstream.status,
           headers: {
@@ -196,7 +204,7 @@ export default {
           },
           body: JSON.stringify(payload)
         });
-        if(!upstream.ok)return upstreamFailure(upstream,cors);
+        if(!upstream.ok)return upstreamFailure(upstream,cors,responseBody,payload.model,env.XKIRO_API_KEY);
         if(responseBody.includes(env.XKIRO_API_KEY))return json({error:'Respuesta upstream inválida'},502,cors);
         return new Response(responseBody, {
           status: upstream.status,

@@ -18,7 +18,7 @@ for(const statuses of [[200],[503,503,200],[401],[403],[400],[429],[500,502,200]
   const local=await h.api.nexusAgentTurn('Nexus busca ácido nítrico');assert.equal(local.actions[0].result.ok,true);assert.equal(h.api.state.inventory.length,111);
  }finally{h.close()}
 });
-test('503 cooldown usa lastKnownGoodModel y permite preferentes al expirar',async()=>{
+test('503 cooldown conserva prioridad del último modelo funcional al expirar',async()=>{
  const attempts=[];let now=1000000;const h=harness({fetcher:(url,opts)=>{
   if(!opts?.body)return catalog(chain);
   const model=JSON.parse(opts.body).model;attempts.push(model);
@@ -26,7 +26,7 @@ test('503 cooldown usa lastKnownGoodModel y permite preferentes al expirar',asyn
  }});
  try{h.api.state.web=true;h.window.Date.now=()=>now;
   await h.api.xkiroGenerate({question:'test'});await h.api.xkiroGenerate({question:'test'});assert.deepEqual(attempts,[...chain,'last']);
-  now+=13*60*1000;assert.deepEqual(Array.from(h.api.orderXKiroCandidates(chain.map(id=>({id}))),x=>x.id),chain);
+  now+=13*60*1000;assert.deepEqual(Array.from(h.api.orderXKiroCandidates(chain.map(id=>({id}))),x=>x.id),['last','preferred','secondary']);
  }finally{h.close()}
 });
 test('429 bloquea nuevos intentos hasta Retry-After',async()=>{

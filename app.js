@@ -16,7 +16,7 @@ const REPO_OWNER='miqueas80';
 const REPO_NAME='';
 const REPO_BRANCH='';
 const DOC_MAX_BYTES=16*1024*1024;
-const APP_VERSION='2026.10.07-r31.1-local-first-invariant';
+const APP_VERSION='2026.10.07-r31.2-xkiro-expo-test';
 const INVENTORY_RECOVERY_KEY='nexus_x_inventory_recovery_v1';
 const health={storage:'sin comprobar',documents:'sin comprobar',errors:[],boot:'BOOT'};
 const LENS_EXTERNAL_CACHE_TTL=30*60*1000;
@@ -444,12 +444,51 @@ async function runResearchAI(q,hits=[],docHits=[]){
 }
 const externalRequests=new Set();
 const xkiroAvailability=new Map();
+const XKIRO_VERIFIED_EXPO_MODEL='mistralai/ministral-14b';
+const XKIRO_GOOD_MODEL_KEY='nexus_xkiro_good_models_v1';
+const XKIRO_GOOD_MODEL_TTL=24*60*60*1000;
+const xkiroGoodModels=readJsonStorage(XKIRO_GOOD_MODEL_KEY,{});
 let lastKnownGoodModel='',xkiroRetryAt=0;
-function orderXKiroCandidates(models){
+function knownXKiroModel(mode){
+ const saved=xkiroGoodModels?.[mode];
+ return saved&&typeof saved.id==='string'&&Number.isFinite(saved.at)&&Date.now()-saved.at>=0&&Date.now()-saved.at<XKIRO_GOOD_MODEL_TTL?saved.id:'';
+}
+function rememberXKiroModel(id,mode){
+ lastKnownGoodModel=id;xkiroAvailability.delete(id);
+ if(xkiroGoodModels&&typeof xkiroGoodModels==='object'&&!Array.isArray(xkiroGoodModels)){
+  xkiroGoodModels[mode]={id,at:Date.now()};
+  try{localStorage.setItem(XKIRO_GOOD_MODEL_KEY,JSON.stringify(xkiroGoodModels))}catch{}
+ }
+}
+function orderXKiroCandidates(models,mode='text'){
  const now=Date.now();if(xkiroRetryAt>now)return [];
- const cooling=[...xkiroAvailability.values()].some(until=>until>now);
- const ready=models.filter(m=>(xkiroAvailability.get(m.id)||0)<=now);
- return cooling&&lastKnownGoodModel?[...ready].sort((a,b)=>Number(b.id===lastKnownGoodModel)-Number(a.id===lastKnownGoodModel)):ready;
+ const seen=new Set(),preferred=knownXKiroModel(mode)||lastKnownGoodModel;
+ const ready=models.filter(m=>{if(seen.has(m.id))return false;seen.add(m.id);return (xkiroAvailability.get(m.id)||0)<=now;});
+ const rank=m=>m.id===preferred?0:m.id===XKIRO_VERIFIED_EXPO_MODEL?1:2;
+ return [...ready].sort((a,b)=>rank(a)-rank(b));
+}
+function verifiedXKiroFallback(id,mode){return id===knownXKiroModel(mode)||id===XKIRO_VERIFIED_EXPO_MODEL;}
+async function xkiroFailure(response,model){
+ let data={},body='';try{body=(await response.clone().text()).slice(0,16384);data=JSON.parse(body)}catch{}
+ const upstream=data?.error?.detail||data?.error||{};
+ const message=typeof upstream==='object'?String(upstream.message||''):'';
+ const blocked=Number(data.error_code)===1010||upstream.kind==='cloudflare_block'||response.status===403&&/error\s*(?:code\s*)?1010/i.test(body);
+ const modelAuth=response.status===401&&(/^User not found\.?$/i.test(message.trim())||upstream.kind==='model_auth');
+ const kind=blocked?'cloudflare_block':modelAuth?'model_auth':[401,403].includes(response.status)?'authentication':response.status===429?'rate_limit':response.status===503?'model_unavailable':'upstream';
+ // Only fixed, recognized messages enter diagnostics; never raw upstream text.
+ const diagnostic={status:response.status,model,kind,
+  message:modelAuth?'User not found.':blocked?'Cloudflare Error 1010':kind==='authentication'?'Autenticación externa rechazada':kind==='rate_limit'?'Límite temporal de solicitudes':kind==='model_unavailable'?'Modelo temporalmente no disponible':'Proveedor externo no disponible',
+  code:modelAuth?'authentication_error':blocked?'1010':kind,
+  rayId:String(data.ray_id||upstream.rayId||response.headers.get('CF-Ray')||'').replace(/[^A-Za-z0-9-]/g,'').slice(0,80),
+  domain:blocked&&['api.xkiro.com','nexus-xkiro-gateway.proyectomj11.workers.dev'].includes(upstream.domain||data.zone)?(upstream.domain||data.zone):blocked?'nexus-xkiro-gateway.proyectomj11.workers.dev':'api.xkiro.com',at:new Date().toISOString()};
+ health.xkiro={...(health.xkiro||{}),status:'degradado',lastError:diagnostic,failures:[...(health.xkiro?.failures||[]),diagnostic].slice(-12)};
+ if(modelAuth||response.status===503)xkiroAvailability.set(model,Date.now()+12*60*1000);
+ if(response.status===429)xkiroRetryAt=Date.now()+retryDelay(response.headers.get('Retry-After'));
+ return diagnostic;
+}
+function xkiroFailureError(diagnostic){
+ const error=new Error(diagnostic.kind==='cloudflare_block'?'La conexión externa fue bloqueada por Cloudflare.':diagnostic.kind==='authentication'?'El proveedor rechazó la autenticación de esta solicitud.':`Servicio externo no disponible (HTTP ${diagnostic.status}).`);
+ error.xkiroDiagnostic=diagnostic;return error;
 }
 function retryDelay(value){const seconds=Number(value);return value&&Number.isFinite(seconds)?Math.max(0,seconds*1000):Math.max(0,Date.parse(value||'')-Date.now())||60000}
 async function fetchTimeout(url,options={},ms=WEB_TIMEOUT){
@@ -721,10 +760,12 @@ async function loadXKiroModels({force=false}={}){
   String(question||'').slice(0,6000);
 
  const attempted=[];
+ let modelAuthFallback=false;
  let lastError='';
 
  for(const entry of candidates){
   if(!state.web||!navigator.onLine||xkiroRetryAt>Date.now())break;
+  if(modelAuthFallback&&!verifiedXKiroFallback(entry.id,'text'))continue;
   attempted.push(entry.id);
 
   try{
@@ -750,22 +791,12 @@ async function loadXKiroModels({force=false}={}){
     30000
    );
 
-   if(res.status===401||res.status===403){
-    throw new Error(
-     'xKiro Gateway rechazó la credencial protegida (HTTP '+
-     res.status+
-     ').'
-    );
-   }
-
    if(!res.ok){
-    lastError='HTTP '+res.status;
-
-    if([408,429,500,502,503,504].includes(res.status)){
-     continue;
-    }
-
-    throw new Error('xKiro '+lastError);
+    const failure=await xkiroFailure(res,entry.id);lastError=`HTTP ${failure.status}: ${failure.message}`;
+    if(failure.kind==='model_auth'){modelAuthFallback=true;continue;}
+    if(failure.kind==='rate_limit')break;
+    if([408,500,502,503,504].includes(res.status))continue;
+    throw xkiroFailureError(failure);
    }
 
    const data=await res.json();
@@ -785,10 +816,11 @@ async function loadXKiroModels({force=false}={}){
     continue;
    }
 
-   lastKnownGoodModel=entry.id;xkiroAvailability.delete(entry.id);
+   rememberXKiroModel(entry.id,'text');
    health.xkiro={
     ...(health.xkiro||{}),
     status:'conectado',
+    authenticated:true,
     model:entry.id,
     freeModels:catalog.models.length,
     visionModels:catalog.vision.length,
@@ -1309,17 +1341,19 @@ function lensContextForProvider(context){
  async function xkiroVisionAnalyze({imageDataUrl,context=''}) {
  if(!state.web)throw new Error('Internet está desactivado; NEXUS LENS permanece local.');
  const catalog=await loadXKiroModels();
- const candidates=orderXKiroCandidates(catalog.vision||[]).slice(0,8);
+ const candidates=orderXKiroCandidates(catalog.vision||[],'vision').slice(0,8);
 
  if(!candidates.length){
   throw new Error('xKiro no encontró modelos gratuitos con visión.');
  }
 
  const attempted=[];
+ let modelAuthFallback=false;
  let lastError='';
 
  for(const entry of candidates){
   if(!state.web||!navigator.onLine||xkiroRetryAt>Date.now())break;
+  if(modelAuthFallback&&!verifiedXKiroFallback(entry.id,'vision'))continue;
   attempted.push(entry.id);
 
   try{
@@ -1359,22 +1393,12 @@ function lensContextForProvider(context){
     30000
    );
 
-   if(response.status===401||response.status===403){
-    throw new Error(
-     'xKiro rechazó la credencial protegida del Gateway (HTTP '+
-     response.status+
-     ').'
-    );
-   }
-
    if(!response.ok){
-    lastError='HTTP '+response.status;
-
-    if([408,429,500,502,503,504].includes(response.status)){
-     continue;
-    }
-
-    throw new Error('xKiro Vision '+lastError);
+    const failure=await xkiroFailure(response,entry.id);lastError=`HTTP ${failure.status}: ${failure.message}`;
+    if(failure.kind==='model_auth'){modelAuthFallback=true;continue;}
+    if(failure.kind==='rate_limit')break;
+    if([408,500,502,503,504].includes(response.status))continue;
+    throw xkiroFailureError(failure);
    }
 
    const data=await response.json();
@@ -1397,10 +1421,11 @@ function lensContextForProvider(context){
 
    const analysis=parseLensVisionPayload(answer);
 
-   lastKnownGoodModel=entry.id;xkiroAvailability.delete(entry.id);
+   rememberXKiroModel(entry.id,'vision');
    health.xkiro={
     ...(health.xkiro||{}),
     status:'conectado',
+    authenticated:true,
     model:entry.id,
     freeModels:catalog.models.length,
     visionModels:catalog.vision.length,
@@ -2279,8 +2304,8 @@ async function prepareOfflineEngine(group){
  }catch(error){if(status)status.textContent='Error recuperable · '+error.message;return false}
  finally{if(button)button.disabled=false;}
 }
-let voiceLastSpoken='',voiceUtteranceId=0,voicePartialInterrupted=false;
-function voiceTextIsEcho(text){const n=norm(text).replace(/[^a-z0-9 ]/g,'').trim();return voiceSpeaking&&n.length>8&&norm(voiceLastSpoken).replace(/[^a-z0-9 ]/g,'').includes(n);}
+let voiceLastSpoken='',voiceUtteranceId=0,voicePartialInterrupted=false,voiceEchoUntil=0;
+function voiceTextIsEcho(text){const n=norm(text).replace(/[^a-z0-9 ]/g,'').trim();return (voiceSpeaking||Date.now()<voiceEchoUntil)&&n.length>8&&norm(voiceLastSpoken).replace(/[^a-z0-9 ]/g,'').includes(n);}
 function receiveVoicePartial(text){
  if(voiceMonitoring&&voiceSpeaking&&VOICE_WAKE.test(text)&&!voiceTextIsEcho(text)){
   ++voiceUtteranceId;globalThis.speechSynthesis?.cancel();voiceSpeaking=false;voicePartialInterrupted=true;voiceAwaitingCommand=true;
@@ -2351,12 +2376,12 @@ async function startVoiceRecognition({automatic=false}={}){
 function spanishVoiceScore(voice){const lang=String(voice?.lang||'').toLowerCase();let score=lang==='es-ar'?300:lang==='es-es'?240:lang.startsWith('es-')?190:lang==='es'?170:-1;if(score<0)return score;if(voice?.localService)score+=30;return score}
 function selectSpanishVoice(voices,{localOnly=false}={}){return (voices||[]).filter(v=>spanishVoiceScore(v)>=0&&(!localOnly||v.localService)).sort((a,b)=>spanishVoiceScore(b)-spanishVoiceScore(a))[0]||null}
 function selectLocalSpanishVoice(voices){return selectSpanishVoice(voices,{localOnly:true})}
-function speechTextForTTS(text){let s=String(text??'').replace(/(?:^|\n)\s*(?:LOCAL|EXTERNA(?: NO DISPONIBLE)?)\s*·\s*/g,' ').replace(/\n\s*(?:Fuentes:|Sin fuentes web verificables).*$/is,'').replace(/https?:\/\/\S+/gi,' ').replace(/[*_`#]/g,' ').replace(/\s+/g,' ').trim();if(s.length>560){const cut=s.slice(0,560),stop=Math.max(cut.lastIndexOf('. '),cut.lastIndexOf('? '),cut.lastIndexOf('! '));s=(stop>180?cut.slice(0,stop+1):cut.trimEnd()+'…')}return s}
+function speechTextForTTS(text){let s=String(text??'').replace(/(?:^|\n)\s*EXTERNA NO DISPONIBLE\s*·[^\n]*/g,' El servicio externo no está disponible. Las funciones locales siguen disponibles.').replace(/[^\n]*(?:HTTP\s*\d{3}|authentication_error|User not found|Missing ClientApiKey|Error 1010|Ray ID)[^\n]*/gi,' El servicio externo no está disponible.').replace(/(?:^|\n)\s*(?:LOCAL|EXTERNA(?: NO DISPONIBLE)?)\s*·\s*/g,' ').replace(/\n\s*(?:Fuentes:|Sin fuentes web verificables).*$/is,'').replace(/https?:\/\/\S+/gi,' ').replace(/[*_`#]/g,' ').replace(/\s+/g,' ').trim();if(s.length>560){const cut=s.slice(0,560),stop=Math.max(cut.lastIndexOf('. '),cut.lastIndexOf('? '),cut.lastIndexOf('! '));s=(stop>180?cut.slice(0,stop+1):cut.trimEnd()+'…')}return s}
 function speakText(text){
  if(!globalThis.speechSynthesis||typeof globalThis.SpeechSynthesisUtterance!=='function')return false;const synth=globalThis.speechSynthesis,voices=typeof synth.getVoices==='function'?synth.getVoices():[],online=navigator.onLine!==false,voice=online?selectSpanishVoice(voices):selectLocalSpanishVoice(voices),spoken=speechTextForTTS(text);if(!spoken)return false;
  const token=++voiceUtteranceId;synth.cancel();voiceSpeaking=true;voiceLastSpoken=spoken.replace(/\bnexus(?:[- ]?x)?\b/gi,'el sistema');const utterance=new SpeechSynthesisUtterance(voiceLastSpoken);if(voice)utterance.voice=voice;utterance.lang=voice?.lang||'es-AR';utterance.rate=.98;utterance.pitch=1;
  if(globalThis.NexusOffline)globalThis.NexusOffline.diagnostics.voice.tts={name:voice?.name||'voz predeterminada',language:utterance.lang,local:voice?Boolean(voice.localService):null,mode:online?'online/híbrida':'offline/local-preferida'};
- const finish=()=>{if(token!==voiceUtteranceId)return;voiceSpeaking=false;if(voiceMonitoring){if(voicePendingIntent){voiceAwaitingCommand=true;$('#voiceStatusText').textContent='Te escucho · respuesta pendiente'}else $('#voiceStatusText').textContent='Dormido · esperando “Nexus”'}};utterance.onend=finish;utterance.onerror=finish;synth.speak(utterance);return true;
+ const finish=()=>{if(token!==voiceUtteranceId)return;voiceSpeaking=false;voiceEchoUntil=Date.now()+2500;if(voiceMonitoring){if(voicePendingIntent){voiceAwaitingCommand=true;$('#voiceStatusText').textContent='Te escucho · respuesta pendiente'}else $('#voiceStatusText').textContent='Dormido · esperando “Nexus”'}};utterance.onend=finish;utterance.onerror=finish;synth.speak(utterance);return true;
 }
 function initVoice(){
  refreshLocalVoiceStatus().catch(()=>{});$('#installVoiceLanguage').onclick=installLocalVoiceLanguage;
